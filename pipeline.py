@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pipeline multi-model dinamis: seluruh pembagian peran, model, dan urutan dikendalikan 100% oleh prompt.
-Konfigurasi endpoint & key dibaca dari models.json dan keys.json.
+Pipeline multi-model: Gemini (rencana) -> DeepSeek (tambah fitur) -> Sonnet (kode)
+-> cek otomatis -> DeepSeek (periksa) -> hasil dikirim ke kamu.
+
+Pakai:
+  export VIKEY_API_KEY="..."
+  python3 pipeline.py "bot WA yang ..." --name wa-bot
+  python3 pipeline.py "..." --name x --rounds 3 --approve
+  python3 pipeline.py --resume nama-proyek          # lanjut dari PROJECT.md (lewati rencana)
+  python3 pipeline.py "ide asli" --resume nama-proyek  # kalau IDEA.txt belum ada (proyek lama)
+
+  python3 pipeline.py "..." --group-model "html=gemini,node=deepseek,lainnya=sonnet"  # model per kelompok file
+
+Semua model per peran bisa ditulis langsung di prompt (tanpa flag), contoh:
+  "buat web portofolio ..., planning deepseek, html deepseek, css sonnet, node js deepseek, preview gemini, fix bug sonnet, nama: porto-huma"
+  Peran: planning, html, css, node js (backend), preview, fix bug. Model: gemini, deepseek, sonnet. "tanpa preview" = lewati tahap itu.
+
+Kode ditulis bertahap per kelompok file (html dulu, lalu node js, dst), tiap kelompok dicek sintaksnya.
+Hasil ada di folder projects/<name>/ : kode, PROJECT.md, DECISIONS.md, REVIEW.md
 """
 import argparse
 import datetime
@@ -18,24 +34,24 @@ import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 
-# ---------- Konfigurasi Endpoint dari models.json ----------
-MODELS_FILE = HERE / "models.json"
-MODELS_CFG = {"default": "gemini-hydrogen", "models": {}}
-if MODELS_FILE.exists():
-    try:
-        MODELS_CFG = json.loads(MODELS_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"    peringatan: gagal baca models.json ({e!r})", flush=True)
-
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL") or MODELS_CFG.get("default") or "gemini-hydrogen"
-FALLBACK_URL = os.getenv("API_BASE_URL") or os.getenv("VIKEY_BASE_URL", "http://127.0.0.1:20128/v1")
-FALLBACK_KEY = os.getenv("API_KEY") or os.getenv("ROUTER_API_KEY") or os.getenv("VIKEY_API_KEY", "sk-local")
-
+# ---------- Konfigurasi ----------
+VIKEY_URL = os.getenv("VIKEY_BASE_URL", "https://api.vikey.ai/v1")
+VIKEY_KEY = os.getenv("VIKEY_API_KEY", "")
 GEMINI_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
-GEMINI_DIRECT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_DAILY_LIMIT = int(os.getenv("GEMINI_DAILY_LIMIT", "480"))
-GEMINI_COOLDOWN = 60
+M_GEMINI = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")  # cek nama persisnya di dashboard Google AI Studio
+M_DEEPSEEK = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v4.1-flash-1017")
+M_SONNET = os.getenv("SONNET_MODEL", "anthropic/claude-sonnet-5.5")
 
+GEMINI_DAILY_LIMIT = int(os.getenv("GEMINI_DAILY_LIMIT", "480"))  # batas aman dari 500/hari
+GEMINI_COOLDOWN = 60  # detik istirahat key setelah kena 429
+
+# Harga Rp per 1M token (input, output)
+PRICES = {
+    M_SONNET: (18000, 72000),
+    M_DEEPSEEK: (1800, 6660),
+}
+
+# Konteks tetap untuk semua model (hemat: ditulis sekali, dipakai di semua tahap)
 DEFAULT_CONSTRAINTS = """\
 - Proyek dijalankan di STB HG680P (Armbian, ARM64, RAM 2GB) lewat pm2.
 - Bahasa: Node.js (utamakan) atau Python. Hindari dependensi native yang berat.
@@ -44,27 +60,30 @@ DEFAULT_CONSTRAINTS = """\
 - Kode sederhana, mudah dibaca, dengan komentar singkat di bagian penting.
 """
 
+# Batas diam per koneksi (detik) kalau server berhenti merespons sama sekali; bukan batas total proses.
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "900"))
-CODE_MAX_TOKENS = int(os.getenv("CODE_MAX_TOKENS", "6000"))
-GROUP_MAX_FILES = int(os.getenv("GROUP_MAX_FILES", "5"))
-try:
-    EXTRA_BODY = json.loads(os.getenv("EXTRA_BODY", "") or os.getenv("VIKEY_EXTRA_BODY", "") or "{}")
+
+CODE_MAX_TOKENS = int(os.getenv("CODE_MAX_TOKENS", "6000"))  # batas output per panggilan (per kelompok file); file kepotong diulang sendiri dengan batas 2x
+try:  # parameter tambahan ke Vikey, mis. mematikan reasoning: VIKEY_EXTRA_BODY='{"reasoning_effort":"low"}' (cek nama persisnya di dokumentasi Vikey)
+    EXTRA_BODY = json.loads(os.getenv("VIKEY_EXTRA_BODY", "") or "{}")
 except Exception:
     EXTRA_BODY = {}
+GROUP_MAX_FILES = int(os.getenv("GROUP_MAX_FILES", "5"))  # maks file per kelompok
+BANNED = set()  # model yang dilarang prompt (diisi di run)
+GROUP_MODELS = {}  # dari --group-model: {"html": "gemini", ...}
+PROMPT_GROUP_MODELS = {}  # dari PROMPT: {"html": "deepseek", "css": "sonnet", "node": "deepseek"}
+EXPLICIT = set()  # peran yang ditentukan prompt (bukan default)
 
-ROLES = {}               # {"plan": "...", "expand": "...", "code": "...", "review": "...", "fix": "..."}
-PROMPT_GROUP_MODELS = {} # {"html": "...", "css": "...", "node": "...", ...}
-GROUP_MODELS = {}        # dari --group-model (opsional)
-TOTAL = {"calls": 0}
+TOTAL = {"cost": 0.0, "calls": 0}
 
 # ---------- Skill: aturan tambahan dari folder skills/*.md ----------
 SKILLS_DIR = HERE / "skills"
-SKILLS_MAX_CHARS = int(os.getenv("SKILLS_MAX_CHARS", "40000"))
-SKILL_NAMES = []
-SKILL_MISSING = []
-SKILL_SKIPPED = []
-_FRONT = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
-SKILL_TEXT = ""
+SKILLS_MAX_CHARS = int(os.getenv("SKILLS_MAX_CHARS", "40000"))  # jaga biaya token
+SKILL_NAMES = []  # nama skill yang dimuat
+SKILL_MISSING = []  # nama skill yang diminta tapi filenya tidak ada
+SKILL_SKIPPED = []  # nama skill yang dilewati karena melebihi SKILLS_MAX_CHARS
+_FRONT = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)  # front matter (name/description) dibuang
+SKILL_TEXT = ""  # teks gabungan yang ditempel ke prompt
 
 
 def _norm(s):
@@ -72,6 +91,7 @@ def _norm(s):
 
 
 def skills_from_prompt(idea):
+    """Skill yang disebut di prompt; tanda strip/spasi diabaikan ('antislop' = anti-slop)."""
     if not SKILLS_DIR.is_dir():
         return []
     toks = {_norm(t) for t in re.findall(r"[\w-]+", idea)}
@@ -79,6 +99,7 @@ def skills_from_prompt(idea):
 
 
 def load_skills(idea=""):
+    """Baca skills/*.md. Prioritas pilihan: env SKILLS=nama1,nama2 > skill yang disebut di prompt > semua. Return nama yang dimuat."""
     global SKILL_TEXT
     SKILL_NAMES.clear()
     SKILL_MISSING.clear()
@@ -116,28 +137,199 @@ def load_skills(idea=""):
 def skill_block(heading):
     return f"\n\n{heading}\n{SKILL_TEXT}\n" if SKILL_TEXT else ""
 
+# ---------- Alur model ditentukan PROMPT (prioritas 1); yang tidak disebut ikut default ----------
+LABEL = {"gemini": "Gemini", "deepseek": "DeepSeek", "sonnet": "Sonnet", "skip": "dilewati"}
+VALID = set(LABEL)
+ROLE_DEFAULT = {"plan": "gemini", "expand": "deepseek", "code": "sonnet", "review": "deepseek", "fix": "same"}  # fix "same" = ikut model code
+ROLES = dict(ROLE_DEFAULT)
+MODEL_WORDS = re.compile(r"gemini|deep\s*seek|sonnet|claude", re.IGNORECASE)
+# Larangan model: "tanpa sonnet", "tanpa deepseek", "tanpa gemini", "jangan pakai X", "no X", "without X", dst.
+BAN_RE = re.compile(
+    r"\b(?:jangan|jgn|janganlah|ngga?k?|gak?|tidak|tdk|tanpa|no|without|don'?t|do not)\s+"
+    r"(?:usah\s+)?(?:(?:pakai|pake|pakek|memakai|menggunakan|gunakan|use|using)\s+)?"
+    r"(sonnet|claude|gemini|deep\s*seek)\b",
+    re.IGNORECASE,
+)
+ROUTER_SYS = "Kamu pembaca instruksi. Jawab HANYA dengan JSON valid, tanpa teks lain."
+ROUTER_USER = """\
+Dari prompt pengguna di bawah, ambil model mana yang diminta mengerjakan tiap peran.
+Peran:
+- plan: membuat rencana / struktur project
+- expand: menambah fitur yang terlewat ke rencana
+- code: menulis file kode
+- review: preview / memeriksa hasil / mencari bug
+- fix: memperbaiki masalah yang ketemu
+Nilai: "gemini", "deepseek", "sonnet", atau "skip" (kalau peran itu diminta tidak dikerjakan). Pakai null untuk peran yang TIDAK disebut prompt.
+"banned": daftar model yang dilarang ("jangan pakai X", "tanpa X"), isi dari "gemini","deepseek","sonnet".
+Ikuti urutan dan pembagian kerja persis seperti tertulis di prompt. Abaikan bagian prompt yang tidak soal pembagian model.
 
-# ---------- Event progres untuk bot Discord ----------
+Prompt:
+<<<
+{idea}
+>>>
+
+Jawab: {{"plan":null,"expand":null,"code":null,"review":null,"fix":null,"banned":[]}}"""
+
+
+# ---------- Setelan lewat PROMPT (tanpa terminal) ----------
+# Contoh: "html deepseek, css sonnet, planning deepseek, preview gemini, node js deepseek, fix bug sonnet, nama: porto-huma"
+MODEL_TOKEN = re.compile(r"gemini|deep\s*seek|sonnet|claude", re.IGNORECASE)
+SKIP_RE = re.compile(
+    r"\b(?:tanpa|skip|lewati|lewatin|jangan|gak\s+usah|gausah|ga\s+usah|no|without)\s+(?:tahap\s+)?"
+    r"(preview|review|periksa|fix\s*bug|fix|debug|perbaiki|expand|tambah\s*fitur)\b", re.IGNORECASE)
+# (peran, pola kata kunci). "g:xxx" = kelompok file. Pola yang lebih panjang ditulis lebih dulu.
+ROLE_PATTERNS = [
+    ("plan", r"planning|planner|plan|perencanaan|rencana"),
+    ("review", r"preview|reviewer|review|pemeriksaan|periksa|audit"),
+    ("fix", r"fix\s*bug|bug\s*fix|bugfix|fix|debugging|debug|perbaikan|perbaiki|benerin"),
+    ("g:html", r"html|front\s*-?end"),
+    ("g:css", r"css|styling|stylesheet"),
+    ("g:node", r"node\s*\.?\s*js|nodejs|node|back\s*-?end|server|express"),
+    ("code", r"coding|ngoding|kode|code"),
+]
+NAME_RE = re.compile(
+    r"\b(?:nama(?:\s*(?:proyek|project|folder))?(?:nya)?\s*[:=]\s*"
+    r"|nama\s*(?:proyek|project|folder)(?:nya)?\s+|namai\s+|dinamai\s+|name\s*[:=]\s*)"
+    r"[\"'`]?([A-Za-z0-9][A-Za-z0-9_-]{1,40})", re.IGNORECASE)
+KIND_LABEL = {"html": "html", "css": "css", "node": "node js", "lainnya": "lainnya"}
+
+
+def _canon(w):
+    w = re.sub(r"\s+", "", w.lower())
+    return "sonnet" if w == "claude" else w
+
+
+def parse_name(idea):
+    """Nama proyek dari prompt: 'nama: porto-huma' / 'nama proyek porto-huma' / 'namai porto-huma'."""
+    m = NAME_RE.search(idea or "")
+    return re.sub(r"[^a-z0-9]+", "-", m.group(1).lower()).strip("-") if m else None
+
+
+def parse_setup(idea):
+    """Baca 'peran + model' dari prompt tanpa memanggil model. Return ({peran: model}, {peran dilewati})."""
+    skips = set()
+
+    def _skip(m):
+        w = re.sub(r"\s+", "", m.group(1).lower())
+        skips.add("review" if w in ("preview", "review", "periksa") else
+                  "fix" if w.startswith(("fix", "debug", "perbaiki")) else "expand")
+        return " "
+
+    text = SKIP_RE.sub(_skip, BAN_RE.sub(" ", idea))
+    roles = {}
+    for clause in re.split(r"[,;\n]+", text):
+        models = [(m.start(), _canon(m.group(0))) for m in MODEL_TOKEN.finditer(clause)]
+        if not models:
+            continue
+        kws = sorted((m.start(), m.end(), role)
+                     for role, pat in ROLE_PATTERNS
+                     for m in re.finditer(r"\b(?:%s)\b" % pat, clause, re.IGNORECASE))
+        clean = []
+        for k in kws:  # buang kata kunci yang tumpang tindih
+            if not clean or k[0] >= clean[-1][1]:
+                clean.append(k)
+        if any(r != "code" for _, _, r in clean):  # "coding" umum diabaikan kalau ada html/css/node di klausa yang sama
+            clean = [k for k in clean if k[2] != "code"]
+        for i, (st, en, role) in enumerate(clean):
+            nxt = clean[i + 1][0] if i + 1 < len(clean) else len(clause)
+            pick = (next((m for p, m in models if en <= p < nxt), None)  # "html deepseek"
+                    or next((m for p, m in models if p >= en), None)      # "html dan css pakai deepseek"
+                    or next((m for p, m in reversed(models) if p < st), None))  # "deepseek untuk html"
+            if pick:
+                roles[role] = pick
+    return roles, skips
+
+
+def who(role):
+    return LABEL[ROLES[role]]
+
+
+def resolve_roles(idea, no_sonnet_flag=False):
+    """Prioritas: PROMPT > flag --no-sonnet > default. Return (roles, model_dilarang)."""
+    roles = dict(ROLE_DEFAULT)
+    banned = set()
+    EXPLICIT.clear()
+    PROMPT_GROUP_MODELS.clear()
+    setup, skips = parse_setup(idea)  # prioritas tertinggi: pembagian peran yang tertulis di prompt
+    for k, v in setup.items():
+        if k.startswith("g:"):
+            PROMPT_GROUP_MODELS[k[2:]] = v
+        else:
+            roles[k] = v
+            EXPLICIT.add(k)
+    for k in skips:
+        roles[k] = "skip"
+        EXPLICIT.add(k)
+    if no_sonnet_flag:
+        banned.add("sonnet")
+    for m in BAN_RE.finditer(idea):  # "tanpa/jangan pakai sonnet|deepseek|gemini|claude"
+        w = re.sub(r"\s+", "", m.group(1).lower())
+        banned.add("sonnet" if w == "claude" else w)  # "deep seek" sudah jadi "deepseek" lewat penghapusan spasi
+    if MODEL_WORDS.search(idea) and not (setup or skips):  # parser tidak menemukan apa-apa -> Gemini (gratis) menerjemahkan
+        try:
+            data = extract_json(planner_chat(
+                [{"role": "system", "content": ROUTER_SYS},
+                 {"role": "user", "content": ROUTER_USER.format(idea=idea)}], 600, "route")) or {}
+        except Exception as e:
+            print(f"    router gagal ({e!r}), pakai default + deteksi kata kunci", flush=True)
+            data = {}
+        for m in data.get("banned") or []:
+            m = str(m).lower().replace(" ", "")
+            if m in {"gemini", "deepseek", "sonnet"}:
+                banned.add(m)
+        for r in ROLE_DEFAULT:
+            v = data.get(r)
+            v = str(v).lower().strip() if v is not None else ""
+            if v in VALID | {"same"}:
+                roles[r] = v
+                EXPLICIT.add(r)
+    for r in ("plan", "code"):  # peran wajib tidak boleh skip
+        if roles[r] in ("skip", "same"):
+            roles[r] = ROLE_DEFAULT[r] if ROLE_DEFAULT[r] != "same" else "deepseek"
+    if roles["fix"] == "same":
+        roles["fix"] = roles["code"]
+    if "plan" in EXPLICIT and "expand" not in EXPLICIT and roles["expand"] != "skip":
+        roles["expand"] = roles["plan"]  # prompt cuma sebut planning -> tambah fitur ikut model planning
+    pref = [m for m in ("deepseek", "gemini", "sonnet") if m not in banned]
+    for r, v in list(roles.items()):  # model terlarang diganti
+        if v in banned:
+            roles[r] = pref[0] if pref else v
+    return roles, sorted(banned)
+
+
+def ask(role, msgs, max_tokens, tag, on_text=None, model=None):
+    """Panggil model yang ditugaskan untuk peran ini (model=... untuk memaksa model tertentu)."""
+    m = model or ROLES[role]
+    if m == "gemini":  # tanpa stream; kalau semua key Gemini gagal, planner_chat fallback ke DeepSeek
+        return planner_chat(msgs, max_tokens, tag)
+    return vikey_chat(M_SONNET if m == "sonnet" else M_DEEPSEEK, msgs, max_tokens, tag, on_text=on_text)
+
+
+# Event progres untuk bot Discord: dicetak sebagai baris "@@{json}" kalau PIPELINE_EVENTS=1.
 EVENTS = os.getenv("PIPELINE_EVENTS", "") == "1"
 
 
 def ev(kind, **kw):
+    """kind: start (mulai langkah), done (selesai, boleh ganti teks), fail, note (catatan)."""
     if EVENTS:
         print("@@" + json.dumps({"e": kind, **kw}, ensure_ascii=False), flush=True)
 
 
-# ---------- Util HTTP & Rotasi Key Gemini (keys.json) ----------
+# ---------- Util umum ----------
 def log_usage(model, usage, tag=""):
     p = usage.get("prompt_tokens", 0) or 0
     c = usage.get("completion_tokens", 0) or 0
+    price = PRICES.get(model, (0, 0))
+    cost = p * price[0] / 1e6 + c * price[1] / 1e6
+    TOTAL["cost"] += cost
     TOTAL["calls"] += 1
     rec = {
         "t": datetime.datetime.now().isoformat(timespec="seconds"),
-        "model": model, "tag": tag, "in": p, "out": c,
+        "model": model, "tag": tag, "in": p, "out": c, "rp": round(cost, 2),
     }
     with open(HERE / "usage.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
-    print(f"    [{model}] in={p} out={c}", flush=True)
+    print(f"    [{model.split('/')[-1]}] in={p} out={c} ~Rp{cost:,.0f}", flush=True)
 
 
 def http_chat(base, key, model, messages, max_tokens, temperature=0.3, timeout=HTTP_TIMEOUT, extra=None):
@@ -154,6 +346,7 @@ def http_chat(base, key, model, messages, max_tokens, temperature=0.3, timeout=H
 
 
 def http_chat_stream(base, key, model, messages, max_tokens, on_text, temperature=0.3, timeout=HTTP_TIMEOUT, extra=None):
+    """Panggil model dengan stream; tiap potongan teks diteruskan ke on_text. Return (teks, usage)."""
     body = json.dumps({
         "model": model, "messages": messages,
         "max_tokens": max_tokens, "temperature": temperature,
@@ -185,45 +378,27 @@ def http_chat_stream(base, key, model, messages, max_tokens, on_text, temperatur
     return "".join(parts), usage
 
 
-def resolve_endpoint(model_name):
-    """Ambil (base_url, real_model_id, api_key, use_pool) dari models.json."""
-    reg = MODELS_CFG.get("models") or {}
-    key_lower = model_name.strip().lower()
-    entry = reg.get(model_name) or next((v for k, v in reg.items() if k.lower() == key_lower), None)
-
-    if entry:
-        base_url = entry.get("base_url") or FALLBACK_URL
-        real_model = entry.get("model") or model_name
-        env_name = entry.get("api_key_env") or ""
-        api_key = (os.getenv(env_name) if env_name else "") or entry.get("api_key") or FALLBACK_KEY
-        use_pool = bool(entry.get("use_gemini_pool"))
-        return base_url, real_model, api_key, use_pool
-
-    return FALLBACK_URL, model_name, FALLBACK_KEY, (key_lower == "gemini")
-
-
-def gateway_chat(base_url, api_key, real_model, messages, max_tokens=3000, tag="", on_text=None):
-    """Panggil endpoint OpenAI-compatible sesuai models.json."""
-    if not api_key:
-        sys.exit(f"API key untuk model '{real_model}' kosong. Cek api_key_env di models.json dan .env.")
+def vikey_chat(model, messages, max_tokens=3000, tag="", on_text=None):
+    if not VIKEY_KEY:
+        sys.exit("VIKEY_API_KEY belum di-set.")
     last_err = None
-    if on_text:
+    if on_text:  # coba stream dulu supaya progres per file kelihatan; kalau gagal, jalan biasa
         try:
-            text, usage = http_chat_stream(base_url, api_key, real_model, messages, max_tokens, on_text, extra=EXTRA_BODY)
+            text, usage = http_chat_stream(VIKEY_URL, VIKEY_KEY, model, messages, max_tokens, on_text, extra=EXTRA_BODY)
             if text:
-                if not usage:
+                if not usage:  # penyedia tidak kirim usage: perkirakan kasar (4 karakter ~ 1 token)
                     usage = {"prompt_tokens": sum(len(m["content"]) for m in messages) // 4,
                              "completion_tokens": len(text) // 4}
-                log_usage(real_model, usage, tag)
+                log_usage(model, usage, tag)
                 return text
         except Exception as e:
             print(f"    stream gagal ({e!r}), pakai panggilan biasa", flush=True)
     for attempt in range(3):
         try:
-            data = http_chat(base_url, api_key, real_model, messages, max_tokens, extra=EXTRA_BODY)
-            log_usage(real_model, data.get("usage", {}), tag)
+            data = http_chat(VIKEY_URL, VIKEY_KEY, model, messages, max_tokens, extra=EXTRA_BODY)
+            log_usage(model, data.get("usage", {}), tag)
             content = data["choices"][0]["message"].get("content")
-            if not (content or "").strip():
+            if not (content or "").strip():  # token habis dipakai reasoning -> ulang dengan batas lebih besar
                 last_err = "jawaban kosong (token habis untuk reasoning?)"
                 max_tokens = min(max_tokens * 2, 32000)
                 print(f"    {last_err}, ulang dengan max_tokens={max_tokens}", flush=True)
@@ -235,27 +410,24 @@ def gateway_chat(base_url, api_key, real_model, messages, max_tokens=3000, tag="
                 time.sleep(3 * (attempt + 1))
                 continue
             break
-        except Exception as e:
+        except Exception as e:  # jaringan, timeout, dll
             last_err = repr(e)
             time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"Panggilan {real_model} gagal: {last_err}")
+    raise RuntimeError(f"Panggilan {model} gagal: {last_err}")
 
 
+# ---------- Rotasi key Gemini ----------
 class GeminiPool:
-    """Pool API key gratis Google AI Studio dari keys.json."""
     def __init__(self):
         keys = []
         kp = HERE / "keys.json"
         if kp.exists():
-            try:
-                keys += json.loads(kp.read_text(encoding="utf-8")).get("gemini", [])
-            except Exception as e:
-                print(f"    peringatan: gagal baca keys.json ({e!r})", flush=True)
+            keys += json.loads(kp.read_text()).get("gemini", [])
         keys += [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
         self.keys = list(dict.fromkeys(keys))
         self.state_path = HERE / "keys_state.json"
         try:
-            self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.state = json.loads(self.state_path.read_text())
         except Exception:
             self.state = {}
 
@@ -264,7 +436,7 @@ class GeminiPool:
         return key[-8:]
 
     def _save(self):
-        self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
+        self.state_path.write_text(json.dumps(self.state))
 
     def _entry(self, key):
         today = str(datetime.date.today())
@@ -281,18 +453,18 @@ class GeminiPool:
             e = self._entry(k)
             if e["count"] < GEMINI_DAILY_LIMIT and e["cool"] <= now:
                 out.append((e["count"], k))
-        out.sort()
+        out.sort()  # pakai yang paling sedikit terpakai dulu
         return [k for _, k in out]
 
     def chat(self, messages, max_tokens=3000, tag=""):
         for key in self.available():
             e = self._entry(key)
             try:
-                data = http_chat(GEMINI_URL, key, GEMINI_DIRECT_MODEL, messages, max_tokens)
+                data = http_chat(GEMINI_URL, key, M_GEMINI, messages, max_tokens)
                 e["count"] += 1
                 self._save()
                 u = data.get("usage", {})
-                print(f"    [gemini-direct] in={u.get('prompt_tokens', 0)} out={u.get('completion_tokens', 0)} (gratis)", flush=True)
+                print(f"    [gemini] in={u.get('prompt_tokens', 0)} out={u.get('completion_tokens', 0)} (gratis)", flush=True)
                 return data["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e2:
                 if e2.code == 429:
@@ -301,120 +473,32 @@ class GeminiPool:
                         e["count"] = GEMINI_DAILY_LIMIT
                     self._save()
                     continue
+                print(f"    gemini error HTTP {e2.code}, coba key lain", flush=True)
                 continue
-            except Exception:
+            except Exception as ex:
+                print(f"    gemini error {ex!r}, coba key lain", flush=True)
                 continue
-        raise RuntimeError("Semua key Gemini di keys.json habis/error")
+        raise RuntimeError("Semua key Gemini habis/error")
 
 
 POOL = GeminiPool()
 
 
-def call_model(model_name, messages, max_tokens=3000, tag="", on_text=None):
-    """Kirim permintaan ke model apa pun sesuai konfigurasi di models.json / keys.json."""
-    m = (model_name or DEFAULT_MODEL).strip()
-    base_url, real_model, api_key, use_pool = resolve_endpoint(m)
-    if use_pool and POOL.keys:
+def planner_chat(messages, max_tokens=3000, tag=""):
+    """Ketua (Gemini). Kalau gagal semua, fallback ke DeepSeek."""
+    if POOL.keys:
         try:
             return POOL.chat(messages, max_tokens, tag)
         except RuntimeError as e:
-            print(f"    {e} -> fallback ke {DEFAULT_MODEL}", flush=True)
-            ev("note", text=f"Key Gemini habis, fallback ke {DEFAULT_MODEL}")
-            if m.lower() != DEFAULT_MODEL.lower():
-                return call_model(DEFAULT_MODEL, messages, max_tokens, tag, on_text=on_text)
-    return gateway_chat(base_url, api_key, real_model, messages, max_tokens, tag, on_text=on_text)
-
-
-def ask(role, msgs, max_tokens, tag, on_text=None, model=None):
-    return call_model(model or ROLES.get(role) or DEFAULT_MODEL, msgs, max_tokens, tag, on_text=on_text)
-
-
-def who(role):
-    return ROLES.get(role) or DEFAULT_MODEL
-
-
-# ---------- Routing 100% dari PROMPT ----------
-NAME_RE = re.compile(
-    r"\b(?:nama(?:\s*(?:proyek|project|folder))?(?:nya)?\s*[:=]\s*"
-    r"|nama\s*(?:proyek|project|folder)(?:nya)?\s+|namai\s+|dinamai\s+|name\s*[:=]\s*)"
-    r"[\"'`]?([A-Za-z0-9][A-Za-z0-9_-]{1,40})", re.IGNORECASE)
-
-ROUTER_SYS = "Kamu parser instruksi routing model AI. Jawab HANYA dengan JSON valid, tanpa markdown atau teks lain."
-ROUTER_USER = """\
-Ekstrak pembagian model AI yang diminta user di dalam prompt berikut. Jangan mengarang nama model yang tidak disebut user.
-Peran tahap:
-- "plan": membuat rencana / struktur project (planning)
-- "expand": menambah fitur / menyempurnakan rencana (isi "skip" jika user minta langsung buat file tanpa expand, atau null jika tidak disebut)
-- "code": menulis kode secara umum
-- "review": preview / memeriksa hasil / mencari bug
-- "fix": memperbaiki bug / masalah
-
-Kelompok file spesifik ("groups"):
-- Jika user menyebut model khusus untuk bagian/ekstensi file tertentu (misal "html", "css", "node", "python", "lainnya"), masukkan ke objek "groups".
-
-Aturan nilai:
-- Tulis persis nama model seperti yang ditulis user (contoh: "gemini", "gemini-hydrogen", "deepseek", "sonnet", dll).
-- Tulis "skip" HANYA jika user secara eksplisit meminta melewati tahap tersebut (contoh: "tanpa preview", "skip expand").
-- Tulis null jika user tidak menyebut model untuk peran tersebut.
-- Jika user menyebut "sisanya pakai X" atau "lainnya X", isi "fallback" dengan "X" (selain itu null).
-
-Prompt user:
-<<<
-{idea}
->>>
-
-Jawab persis format JSON ini:
-{{"plan":null,"expand":null,"code":null,"review":null,"fix":null,"groups":{{}},"fallback":null}}"""
-
-
-def parse_name(idea):
-    m = NAME_RE.search(idea or "")
-    return re.sub(r"[^a-z0-9]+", "-", m.group(1).lower()).strip("-") if m else None
-
-
-def resolve_roles(idea):
-    """Baca pembagian model langsung dari kalimat bebas prompt menggunakan LLM router."""
-    roles = {r: None for r in ("plan", "expand", "code", "review", "fix")}
-    PROMPT_GROUP_MODELS.clear()
-    data = {}
-    try:
-        raw = call_model(
-            DEFAULT_MODEL,
-            [{"role": "system", "content": ROUTER_SYS},
-             {"role": "user", "content": ROUTER_USER.format(idea=idea)}],
-            600, "route"
-        )
-        data = extract_json(raw) or {}
-    except Exception as e:
-        print(f"    router prompt gagal ({e!r}), memakai DEFAULT_MODEL ({DEFAULT_MODEL})", flush=True)
-
-    fb = str(data.get("fallback") or "").strip() or DEFAULT_MODEL
-    for r in roles:
-        val = str(data.get(r) or "").strip()
-        roles[r] = val if val and val.lower() != "null" else None
-
-    for k, v in (data.get("groups") or {}).items():
-        nk = _norm(str(k))
-        nv = str(v or "").strip()
-        if nk and nv and nv.lower() != "null":
-            PROMPT_GROUP_MODELS[nk] = nv
-
-    if not roles["plan"]:
-        roles["plan"] = fb
-    if not roles["expand"]:
-        roles["expand"] = roles["plan"]
-    if not roles["code"]:
-        roles["code"] = next(iter(PROMPT_GROUP_MODELS.values()), fb)
-    if not roles["review"]:
-        roles["review"] = fb
-    if not roles["fix"]:
-        roles["fix"] = roles["code"]
-
-    return roles
+            print(f"    {e} -> fallback DeepSeek", flush=True)
+            ev("note", text="Gemini gagal, pindah ke DeepSeek")
+    return vikey_chat(M_DEEPSEEK, messages, max_tokens, tag)
 
 
 # ---------- Parsing & cek file ----------
 FILE_RE = re.compile(r"=== FILE: (.+?) ===\n(.*?)\n=== END ===", re.DOTALL)
+
+
 HEAD_LINE = re.compile(r"^\W*=== FILE:\s*(.+?)\s*===\W*$")
 
 
@@ -436,6 +520,7 @@ def parse_files(text):
         _clean_file(files, path, content.split("\n"))
     if files:
         return files
+    # cadangan: format agak meleset (tanpa === END ===, output terpotong, header dibungkus **...**)
     cur, buf = None, []
     for line in text.split("\n"):
         m = HEAD_LINE.match(line)
@@ -474,6 +559,7 @@ def read_all(outdir):
 
 
 def auto_checks(outdir):
+    """Cek sintaks otomatis (gratis, tanpa model). Return list masalah."""
     problems = []
     node = shutil.which("node")
     for fp in sorted(outdir.rglob("*")):
@@ -509,10 +595,11 @@ def extract_json(text):
 
 
 class FileWatcher:
+    """Membaca teks yang sedang di-stream dan mengumumkan file yang sedang ditulis model."""
     HEAD = re.compile(r"=== FILE: (.+?) ===")
 
-    def __init__(self, outdir, who_label, parent=None):
-        self.outdir, self.who, self.parent = outdir, who_label, parent
+    def __init__(self, outdir, who, parent=None):
+        self.outdir, self.who, self.parent = outdir, who, parent
         self.buf, self.open, self.names, self.fid = "", None, [], ""
 
     def feed(self, chunk):
@@ -542,6 +629,7 @@ class FileWatcher:
                 self.open = None
 
     def finish(self, full_text):
+        """Panggil setelah model selesai. Kalau stream tidak jalan, umumkan dari teks utuh."""
         if not self.names:
             self.buf = ""
             self.feed(full_text)
@@ -622,9 +710,9 @@ def stage_code(plan, constraints, watcher=None):
 # ---------- Kode bertahap per kelompok file ----------
 GROUP_SYS = "Kamu pembagi tugas. Jawab HANYA dengan JSON valid, tanpa teks lain."
 GROUP_USER = """\
-Bagi file proyek di bawah jadi kelompok penulisan BERURUTAN, supaya tiap kelompok ditulis model dalam satu panggilan pendek (maksimal {n} file per kelompok).
-Ikuti urutan pengerjaan yang diminta user di prompt (misal html dulu, lalu node js, lalu bagian lain). Jika tidak disebut urutan: html/css -> backend -> lainnya.
-Isi "model" dengan nama model persis seperti yang diminta user di prompt untuk kelompok itu; jika user tidak menyebut model khusus untuk kelompok itu, isi null.
+Bagi file proyek di bawah jadi kelompok penulisan BERURUTAN, supaya tiap kelompok ditulis model dalam satu panggilan pendek (maksimal {n} file per kelompok, file yang besar sebaiknya sendirian).
+Ikuti urutan yang diminta di prompt pengguna (misal html dulu, lalu node js, lalu bagian lain). Kalau prompt tidak menyebut urutan: frontend (html/css/js browser) -> backend -> package.json, .env.example, README.
+Isi "model" dengan "gemini", "deepseek", atau "sonnet" HANYA kalau prompt pengguna menyebut model untuk kelompok itu; selain itu null.
 Ambil nama file dari bagian "Struktur file" di rencana, jangan menambah file lain.
 
 Prompt pengguna:
@@ -646,15 +734,17 @@ CODE_FORMAT_PART = CODE_FORMAT.replace(
 PLAN_FILE_RE = re.compile(r"[\w@./-]+\.(?:html|css|js|mjs|cjs|json|md|txt|py|sh|example|ejs)\b")
 NOT_FILES = {"node.js", "express.js", "next.js", "vue.js", "react.js", "nuxt.js", "three.js",
              "discord.js", "chart.js", "d3.js", "socket.io.js"}
+VALID_CODERS = ("gemini", "deepseek", "sonnet")
 
 
 def _rel(p):
-    while p.startswith("./"):
+    while p.startswith("./"):  # hanya buang "./" di depan, titik file seperti .env.example tetap
         p = p[2:]
     return p
 
 
 def fallback_groups(plan):
+    """Kalau Gemini gagal membagi: ambil nama file dari rencana, kelompokkan html/css -> node/py -> lainnya."""
     paths = []
     for m in PLAN_FILE_RE.finditer(plan):
         p = _rel(m.group(0))
@@ -672,13 +762,14 @@ def file_kind(p):
     if ext == ".css":
         return "css"
     if ext in {".html", ".ejs"} or p.startswith(("public/", "views/", "static/")):
-        return "html"
+        return "html"  # termasuk js browser di public/
     if ext in {".js", ".mjs", ".cjs", ".py"}:
         return "node"
     return "lainnya"
 
 
 def split_kinds(groups):
+    """Pecah tiap kelompok jadi html -> css -> node -> lainnya, supaya tiap bagian bisa punya model sendiri."""
     out = []
     for g in groups:
         by = {}
@@ -691,6 +782,7 @@ def split_kinds(groups):
 
 
 def normalize_groups(data):
+    """Rapikan JSON kelompok dari model: buang duplikat, pecah kelompok yang kebanyakan file."""
     out, seen = [], set()
     for g in (data or {}).get("groups") or []:
         if not isinstance(g, dict):
@@ -705,8 +797,8 @@ def normalize_groups(data):
         if not files:
             continue
         name = str(g.get("name") or f"kelompok{len(out) + 1}").strip()[:30]
-        model = str(g.get("model") or "").strip()
-        model = model if model and model.lower() != "null" else None
+        model = str(g.get("model") or "").lower().strip()
+        model = model if model in VALID_CODERS else None
         for i in range(0, len(files), GROUP_MAX_FILES):
             part = files[i:i + GROUP_MAX_FILES]
             out.append({"name": name if i == 0 else f"{name} {i // GROUP_MAX_FILES + 1}",
@@ -715,12 +807,13 @@ def normalize_groups(data):
 
 
 def stage_groups(plan, idea):
+    """Gemini (gratis) membagi file jadi kelompok berurutan; kalau gagal pakai pembagian otomatis."""
     msgs = [
         {"role": "system", "content": GROUP_SYS},
         {"role": "user", "content": GROUP_USER.format(n=GROUP_MAX_FILES, idea=idea, plan=plan)},
     ]
     try:
-        data = extract_json(call_model(who("plan"), msgs, 1500, "groups")) or {}
+        data = extract_json(planner_chat(msgs, 1500, "groups")) or {}
     except Exception as e:
         print(f"    pembagian kelompok gagal ({e!r}), pakai pembagian otomatis", flush=True)
         data = {}
@@ -728,23 +821,20 @@ def stage_groups(plan, idea):
 
 
 def pick_group_model(g):
-    """Prioritas: model kelompok dari router prompt > model per-grup JSON > --group-model > model peran 'code'."""
+    """Prioritas: model yang disebut prompt untuk kelompok itu > flag --group-model > model peran 'code'."""
     nm = _norm(g.get("name", ""))
-    cands = [
-        PROMPT_GROUP_MODELS.get(nm),
-        next((v for k, v in PROMPT_GROUP_MODELS.items() if k and k in nm), None),
-        g.get("model"),
-        next((v for k, v in GROUP_MODELS.items() if k and k in nm), None),
-        ROLES.get("code"),
-        DEFAULT_MODEL,
-    ]
+    cands = [PROMPT_GROUP_MODELS.get(nm), g.get("model")]  # prompt (html/css/node js) > yang dibaca Gemini
+    cands += [v for k, v in GROUP_MODELS.items() if k and k in nm]
+    cands.append(ROLES["code"])
     for c in cands:
-        if c and str(c).strip() and str(c).lower() != "null":
-            return str(c).strip()
-    return DEFAULT_MODEL
+        c = str(c or "").lower().strip()
+        if c in VALID_CODERS and c not in BANNED:
+            return c
+    return ROLES["code"]
 
 
 def context_files(done, budget=12000, per_file=3000):
+    """File yang sudah jadi, dilampirkan (dipotong) supaya kelompok berikutnya cocok dengan yang lama."""
     if not done:
         return ""
     out, used = [], 0
@@ -778,6 +868,7 @@ def stage_code_group(plan, constraints, files, done, label, model, watcher=None,
 
 
 def complete_files(raw):
+    """Hanya file yang lengkap (ada === END ===); file yang kepotong di ujung dibuang."""
     files = {}
     for path, content in FILE_RE.findall(raw):
         _clean_file(files, path, content.split("\n"))
@@ -790,35 +881,38 @@ def log_raw(label, raw):
 
 
 def write_group(outdir, plan, constraints, name, todo, model, gid):
+    """Tulis satu kelompok. File yang kepotong/hilang diulang satu per satu. Return {path: isi} yang ditulis."""
+    GL = LABEL[model]
     done = {p: c for p, c in read_all(outdir).items() if p not in todo}
-    raw = stage_code_group(plan, constraints, todo, done, name, model, FileWatcher(outdir, model, parent=gid))
+    raw = stage_code_group(plan, constraints, todo, done, name, model, FileWatcher(outdir, GL, parent=gid))
     log_raw(name, raw)
     got = complete_files(raw)
-    for f in [f for f in todo if f not in got]:
+    for f in [f for f in todo if f not in got]:  # kepotong / tidak dikeluarkan -> ulang sendiri-sendiri
         fid = f"{gid}-{f}"
-        print(f"    {f} belum lengkap, ditulis ulang sendiri ({model})", flush=True)
-        ev("start", id=fid, text=f"Menulis ulang {f} (satu file)", who=model)
+        print(f"    {f} belum lengkap, ditulis ulang sendiri ({GL})", flush=True)
+        ev("start", id=fid, text=f"Menulis ulang {f} (satu file)", who=GL)
         raw1 = stage_code_group(plan, constraints, [f], {**done, **got}, f, model,
-                                FileWatcher(outdir, model, parent=fid), max_tokens=CODE_MAX_TOKENS * 2)
+                                FileWatcher(outdir, GL, parent=fid), max_tokens=CODE_MAX_TOKENS * 2)
         log_raw(f, raw1)
-        one = complete_files(raw1) or parse_files(raw1)
+        one = complete_files(raw1) or parse_files(raw1)  # parse_files menerima hasil yang kepotong
         if f in one:
             got[f] = one[f]
         elif len(one) == 1:
             got[f] = next(iter(one.values()))
         else:
-            ev("note", text=f"{f} gagal ditulis ({model})")
+            ev("note", text=f"{f} gagal ditulis ({GL})")
         ev("done", id=fid)
-    got = {p: c for p, c in got.items() if p in todo or p not in done}
+    got = {p: c for p, c in got.items() if p in todo or p not in done}  # jangan timpa file lama yang tidak diminta
     write_files(outdir, got)
     return got
 
 
 def code_in_groups(outdir, plan, idea, constraints, resume, decisions):
+    """Tahap 3: tulis kode bertahap per kelompok (html dulu, lalu node js, dst), cek sintaks tiap kelompok."""
     print("3/5 Tulis kode bertahap (per kelompok file)...", flush=True)
     ev("start", id="groups", text="Membagi file jadi kelompok penulisan", who=who("plan"))
     groups = stage_groups(plan, idea)
-    if not groups:
+    if not groups:  # rencana tidak menyebut nama file sama sekali: cara lama (sekali tulis)
         ev("done", id="groups", text="Tidak ada daftar file, tulis sekali jalan")
         L = who("code")
         ev("start", id="code", text="Menulis kode", who=L)
@@ -836,31 +930,33 @@ def code_in_groups(outdir, plan, idea, constraints, resume, decisions):
     (HERE / "last_code_raw.txt").write_text("", encoding="utf-8")
     total = 0
     for gi, g in enumerate(groups, 1):
-        todo = [f for f in g["files"] if not (resume and (outdir / f).is_file())]
+        todo = [f for f in g["files"] if not (resume and (outdir / f).is_file())]  # --resume: file yang sudah ada dilewati
         if not todo:
             continue
         m = pick_group_model(g)
+        GL = LABEL[m]
         gid = f"g{gi}"
-        print(f"3/5 Kelompok {gi}/{len(groups)}: {g['name']} ({m}) -> {', '.join(todo)}", flush=True)
-        ev("start", id=gid, text=f"Menulis kelompok {g['name']} ({len(todo)} file)", who=m)
+        print(f"3/5 Kelompok {gi}/{len(groups)}: {g['name']} ({GL}) -> {', '.join(todo)}", flush=True)
+        ev("start", id=gid, text=f"Menulis kelompok {g['name']} ({len(todo)} file)", who=GL)
         got = write_group(outdir, plan, constraints, g["name"], todo, m, gid)
         ev("done", id=gid)
         total += len(got)
         if not got:
-            decisions.append(f"- Kelompok {g['name']} ({m}): tidak ada file yang berhasil ditulis.\n")
+            decisions.append(f"- Kelompok {g['name']} ({GL}): tidak ada file yang berhasil ditulis.\n")
             continue
-        decisions.append(f"- Kelompok {g['name']} ({m}) menulis {len(got)} file: {', '.join(got)}.\n")
-        problems = [p for p in auto_checks(outdir) if p["file"] in got]
+        decisions.append(f"- Kelompok {g['name']} ({GL}) menulis {len(got)} file: {', '.join(got)}.\n")
+        problems = [p for p in auto_checks(outdir) if p["file"] in got]  # cek sintaks sebelum lanjut
         if problems and ROLES["fix"] != "skip":
             fid = f"{gid}fix"
-            fm = ROLES["fix"]
-            print(f"    {len(problems)} error sintaks, diperbaiki ({fm})...", flush=True)
-            ev("start", id=fid, text=f"Memperbaiki {len(problems)} error sintaks ({g['name']})", who=fm)
+            fm = ROLES["fix"] if "fix" in EXPLICIT else m  # "fix bug sonnet" di prompt berlaku juga di sini
+            FL = LABEL[fm]
+            print(f"    {len(problems)} error sintaks, diperbaiki ({FL})...", flush=True)
+            ev("start", id=fid, text=f"Memperbaiki {len(problems)} error sintaks ({g['name']})", who=FL)
             fixed = parse_files(stage_fix(plan, read_all(outdir), problems,
-                                          FileWatcher(outdir, fm, parent=fid), model=fm))
+                                          FileWatcher(outdir, FL, parent=fid), model=fm))
             if fixed:
                 write_files(outdir, fixed)
-                decisions.append(f"- Kelompok {g['name']}: {fm} memperbaiki {', '.join(fixed)}.\n")
+                decisions.append(f"- Kelompok {g['name']}: {FL} memperbaiki {', '.join(fixed)}.\n")
             ev("done", id=fid)
     if total == 0 and not read_all(outdir):
         ev("fail", id="groups", text="Tidak ada file yang berhasil ditulis")
@@ -910,7 +1006,7 @@ def stage_fix(plan, files, issues, watcher=None, model=None):
 
 
 # ---------- Alur utama ----------
-def run(idea, name, rounds, approve, constraints, resume=False):
+def run(idea, name, rounds, approve, constraints, no_sonnet=False, resume=False):
     outdir = HERE / "projects" / name
     if resume:
         if not (outdir / "PROJECT.md").exists():
@@ -918,10 +1014,11 @@ def run(idea, name, rounds, approve, constraints, resume=False):
         if not idea:
             ip = outdir / "IDEA.txt"
             if not ip.exists():
-                sys.exit("IDEA.txt tidak ada di proyek ini. Kirim ide aslinya sebagai argumen.")
+                sys.exit("IDEA.txt tidak ada di proyek ini. Kirim ide aslinya sebagai argumen: "
+                         f'python3 pipelinenew.py "ide asli" --resume {name}')
             idea = ip.read_text(encoding="utf-8").strip()
     outdir.mkdir(parents=True, exist_ok=True)
-    (outdir / "IDEA.txt").write_text(idea + "\n", encoding="utf-8")
+    (outdir / "IDEA.txt").write_text(idea + "\n", encoding="utf-8")  # supaya --resume tahu ide aslinya
     dp = outdir / "DECISIONS.md"
     if resume and dp.exists():
         decisions = [dp.read_text(encoding="utf-8").rstrip() + "\n", "- Dilanjutkan dengan --resume.\n"]
@@ -931,22 +1028,20 @@ def run(idea, name, rounds, approve, constraints, resume=False):
             decisions.append("- Dilanjutkan dengan --resume.\n")
 
     ev("hello")
+    roles, banned = resolve_roles(idea, no_sonnet)
     ROLES.clear()
-    ROLES.update(resolve_roles(idea))
-
-    print("    alur (dari prompt): " + " -> ".join(
-        f"{who(r)} ({t})" for r, t in
-        [("plan", "rencana"), ("expand", "tambah fitur"), ("code", "kode"), ("review", "periksa"), ("fix", "perbaiki")]
-        if ROLES[r] != "skip"
-    ), flush=True)
-    setup_txt = (
-        f"planning={who('plan')}, preview={who('review')}, fix bug={who('fix')}, "
-        + ", ".join(f"{k}={pick_group_model({'name': k, 'model': None})}" for k in ("html", "css", "node", "lainnya"))
-    )
+    ROLES.update(roles)
+    BANNED.clear()
+    BANNED.update(banned)
+    print("    alur (sesuai prompt): " + " -> ".join(f"{who(r)} ({t})" for r, t in
+          [("plan", "rencana"), ("expand", "tambah fitur"), ("code", "kode"), ("review", "periksa"), ("fix", "perbaiki")]
+          if ROLES[r] != "skip") + (f" | dilarang: {', '.join(banned)}" if banned else ""), flush=True)
+    setup_txt = (f"planning={who('plan')}, preview={who('review')}, fix bug={who('fix')}, "
+                 + ", ".join(f"{KIND_LABEL[k]}={LABEL[pick_group_model({'name': k, 'model': None})]}"
+                             for k in ("html", "css", "node", "lainnya")))
     print("    setelan model: " + setup_txt, flush=True)
     ev("note", text="Setelan model: " + setup_txt)
     decisions.append(f"- Setelan model: {setup_txt}.\n")
-
     names = load_skills(idea)
     if names:
         ev("start", id="skills", text="Memuat skill: " + ", ".join(names))
@@ -957,8 +1052,7 @@ def run(idea, name, rounds, approve, constraints, resume=False):
         ev("note", text=f'Skill "{m}" tidak ditemukan')
     for m in SKILL_SKIPPED:
         print(f"    skill dilewati (melebihi {SKILLS_MAX_CHARS} karakter): {m}", flush=True)
-        ev("note", text=f'Skill "{m}" dilewati: total melebihi {SKILLS_MAX_CHARS} karakter')
-
+        ev("note", text=f'Skill "{m}" dilewati: total melebihi {SKILLS_MAX_CHARS} karakter (naikkan SKILLS_MAX_CHARS)')
     if resume:
         plan = (outdir / "PROJECT.md").read_text(encoding="utf-8")
         print("1-2/5 Dilewati (--resume): memakai PROJECT.md yang sudah ada.", flush=True)
@@ -968,7 +1062,7 @@ def run(idea, name, rounds, approve, constraints, resume=False):
         ev("start", id="plan", text="Menyusun rencana", who=who("plan"))
         plan = stage_plan(idea, constraints)
         ev("done", id="plan")
-        decisions.append(f"- Rencana awal dibuat oleh ({who('plan')}).\n")
+        decisions.append(f"- Rencana awal dibuat oleh ketua ({who('plan')}).\n")
 
         if ROLES["expand"] != "skip":
             print(f"2/5 Tambah fitur terlewat ({who('expand')})...", flush=True)
@@ -1038,20 +1132,21 @@ def run(idea, name, rounds, approve, constraints, resume=False):
     print("5/5 Selesai.")
     print(f"    Status : {status}")
     print(f"    Folder : {outdir}")
-    print(f"    Panggilan model: {TOTAL['calls']}")
+    print(f"    Panggilan model: {TOTAL['calls']}, perkiraan biaya: Rp{TOTAL['cost']:,.0f}")
     print(f"    Ringkasan: {review.get('summary', '-')}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("idea", nargs="?", default="", help="deskripsi proyek")
+    ap.add_argument("idea", nargs="?", default="", help="deskripsi proyek (boleh kosong kalau --resume dan IDEA.txt ada)")
     ap.add_argument("--resume", default=None, metavar="NAMA", help="lanjutkan proyek di projects/NAMA dari PROJECT.md")
     ap.add_argument("--name", default=None, help="nama folder proyek")
     ap.add_argument("--rounds", type=int, default=3, help="maks putaran periksa-perbaiki")
-    ap.add_argument("--approve", action="store_true", help="minta persetujuan sebelum menulis kode")
+    ap.add_argument("--approve", action="store_true", help="minta persetujuan sebelum Sonnet nulis kode")
+    ap.add_argument("--no-sonnet", action="store_true", help="jangan pakai Sonnet (prompt tetap lebih utama)")
     ap.add_argument("--group-model", default=os.getenv("GROUP_MODELS", ""), metavar="K=M,...",
-                    help='opsional override model per kelompok file')
-    ap.add_argument("--constraints", default=None, help="path file batasan teknis")
+                    help='model per kelompok file, contoh: "html=gemini,node=deepseek,lainnya=sonnet" (model yang disebut di prompt tetap lebih utama)')
+    ap.add_argument("--constraints", default=None, help="path file batasan teknis (default: constraints.md atau bawaan)")
     a = ap.parse_args()
 
     if not a.idea and not a.resume:
@@ -1060,11 +1155,11 @@ def main():
     for part in a.group_model.split(","):
         if "=" in part:
             k, v = part.split("=", 1)
-            if _norm(k) and v.strip():
-                GROUP_MODELS[_norm(k)] = v.strip()
+            if _norm(k) and v.strip().lower() in VALID_CODERS:
+                GROUP_MODELS[_norm(k)] = v.strip().lower()
     cpath = pathlib.Path(a.constraints) if a.constraints else HERE / "constraints.md"
     constraints = cpath.read_text(encoding="utf-8") if cpath.exists() else DEFAULT_CONSTRAINTS
-    run(a.idea, name, a.rounds, a.approve, constraints, resume=bool(a.resume))
+    run(a.idea, name, a.rounds, a.approve, constraints, a.no_sonnet, resume=bool(a.resume))
 
 
 if __name__ == "__main__":
