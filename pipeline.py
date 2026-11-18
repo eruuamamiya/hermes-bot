@@ -177,8 +177,10 @@ def http_chat(base, key, model, messages, max_tokens, temperature=0.3, timeout=H
         base.rstrip("/") + "/chat/completions", data=body,
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+   with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "ignore").strip()
+    obj, _ = json.JSONDecoder().raw_decode(raw)  # ambil objek JSON pertama, abaikan sisanya
+    return obj
 
 
 def http_chat_stream(base, key, model, messages, max_tokens, on_text, temperature=0.3, timeout=HTTP_TIMEOUT, extra=None):
